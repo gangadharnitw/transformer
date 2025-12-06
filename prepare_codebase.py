@@ -3,47 +3,52 @@ import tiktoken
 import numpy as np
 
 # --- CONFIGURATION ---
-# CHANGE THIS to your actual firmware folder path
+# IMPORTANT: Update this path to the root directory of your firmware source code.
 SOURCE_DIR = r"C:\Work\Firmware\Src"  
-EXTENSIONS = {'.c', '.h', '.cpp', '.hpp', '.ld', '.s'} 
+# ---
 
 def process_codebase():
-    data = []
-    file_count = 0
-    print(f"Scanning {SOURCE_DIR}...")
+    """Scans a directory, tokenizes all code files, and saves to a binary for training."""
+    data_content = []
+    print(f"Scanning directory: {SOURCE_DIR}...")
     
-    for root, dirs, files in os.walk(SOURCE_DIR):
-        for file in files:
-            if any(file.endswith(ext) for ext in EXTENSIONS):
-                file_path = os.path.join(root, file)
+    for root, _, files in os.walk(SOURCE_DIR):
+        for file_name in files:
+            if file_name.endswith(('.c', '.h', '.cpp', '.hpp', '.s', '.ld')):
+                file_path = os.path.join(root, file_name)
                 try:
                     with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                        # Add headers so the model learns file boundaries
-                        data.append(f"\n/* --- FILE: {file} --- */\n") 
-                        data.append(content)
-                        file_count += 1
+                        # Add a special header so the model learns file boundaries
+                        data_content.append(f"\n/* --- FILE: {file_name} --- */\n")
+                        data_content.append(f.read())
                 except Exception as e:
-                    print(f"Skipping {file}: {e}")
-                    
-    print(f"Found {file_count} files.")
-    full_text = "".join(data)
-    print(f"Total characters: {len(full_text):,}")
-
-    print("Tokenizing... (This may take a minute)")
-    enc = tiktoken.get_encoding("gpt2")
-    ids = enc.encode(full_text)
-    print(f"Total tokens: {len(ids):,}")
-
-    # Split 90% Train / 10% Validation
-    n = int(0.9 * len(ids))
-    train_ids = np.array(ids[:n], dtype=np.uint16)
-    val_ids = np.array(ids[n:], dtype=np.uint16)
+                    print(f"Skipping {file_name} due to error: {e}")
     
-    print("Saving binaries...")
+    if not data_content:
+        print("No files found! Check your SOURCE_DIR and file extensions.")
+        return
+
+    print(f"Found and read {len(data_content)//2} files.")
+    full_text = "".join(data_content)
+    
+    print("Tokenizing text... (This can take a few minutes for large codebases)")
+    enc = tiktoken.get_encoding("gpt2")
+    ids = enc.encode(full_text, disallowed_special=())
+    
+    # Split data into 90% for training, 10% for validation
+    split_index = int(0.9 * len(ids))
+    train_ids = np.array(ids[:split_index], dtype=np.uint16)
+    val_ids = np.array(ids[split_index:], dtype=np.uint16)
+    
+    # Save to binary files
     train_ids.tofile('train.bin')
     val_ids.tofile('val.bin')
-    print("Done! Created 'train.bin' and 'val.bin'")
+    
+    print("="*50)
+    print("Phase 1 Data Ready!")
+    print(f"Created 'train.bin' ({len(train_ids):,} tokens)")
+    print(f"Created 'val.bin' ({len(val_ids):,} tokens)")
+    print("="*50)
 
 if __name__ == '__main__':
     process_codebase()
