@@ -1,76 +1,66 @@
-# GPT
-
-Train a private LLM on your company's C codebase.
-
-## Instructions for EPYC Server (Windows/Linux)
-
-1. **Install Requirements:**
-   `pip install -r requirements.txt`
-
-2. **Ingest Codebase:**
-   - Edit `prepare_codebase.py` -> Set `SOURCE_DIR = "path/to/firmware"`
-   - Run `python prepare_codebase.py`
-   - Creates `train.bin` (Binary dataset).
-
-3. **Train Model:**
-   - Edit `train_gpt.py` -> Ensure "EPYC SERVER" config is uncommented.
-   - Run `python train_gpt.py`
-   - Wait for Loss to drop below 1.5 (approx 2-3 days).
-
-4. **Chat:**
-   - Run `python play.py`
-
-
-
 # Firmware-GPT
 
-Train a private, secure AI assistant on your company's proprietary C codebase.
+This repository contains a complete pipeline to train a private, local AI assistant (a "Baby-GPT") on your company's proprietary C codebase. The model learns your coding style, APIs, and logic, then is fine-tuned to act as a helpful chatbot.
 
-## Features
-- **Pre-training:** Learns your coding style, proprietary APIs, and hardware registers from scratch.
-- **SFT (Supervised Fine-Tuning):** Teaches the model to act as a "Consultant" that can explain logic and answer questions.
-- **100% Local:** Runs entirely on your hardware (Ryzen Laptop or EPYC Server). No data leaves the building.
+The entire process runs 100% offline on your own hardware, ensuring no proprietary code ever leaves your control.
 
 ## Workflow Overview
 
-| Stage | Goal | Data | Time (Est.) |
-| :--- | :--- | :--- | :--- |
-| **1. Ingest** | Convert 1000s of C files to binary | `prepare_codebase.py` | 5 mins |
-| **2. Pre-train** | Teach model to *write* your code | `train_gpt.py` (Stage 1) | 2-5 Days |
-| **3. Label (SFT)** | Create Q&A pairs using local AI | `generate_synthetic_sft.py` | 1-2 Hours |
-| **4. Fine-tune** | Teach model to *explain* code | `train_gpt.py` (Stage 2) | 2 Hours |
+The process is divided into two main phases, followed by a final chat interface.
+
+| Phase | Script | Goal | Data Source | Time Estimate |
+| :--- | :--- | :--- | :--- | :--- |
+| **1. Pre-training** | `prepare_codebase.py`<br>`train_gpt.py` | Teach the model the "language" of your C code. | Your entire firmware codebase (`.c`, `.h` files). | 2-10 days |
+| **2. Fine-tuning** | `prepare_sft_mix.py`<br>`train_gpt.py` | Teach the model how to *answer questions* about code. | A mix of open-source Q&A and your own code. | ~4 hours |
+| **3. Inference** | `chat.py` | Interact with your trained AI assistant. | User prompts. | Real-time |
 
 ---
 
 ## Step-by-Step Guide
 
-### Phase 1: The "Brain" (Pre-training)
-1.  **Configure:** Edit `prepare_codebase.py` and set `SOURCE_DIR` to your firmware src folder.
-2.  **Run:** `python prepare_codebase.py`. This creates `train.bin` (the raw knowledge).
-3.  **Train:** 
+### Step 0: Setup
+1.  Clone this repository.
+2.  Install the required Python libraries:
+    ```
+    pip install torch numpy tiktoken datasets
+    ```
+
+### Step 1: Pre-training (The "Brain")
+*This is the longest but most important phase. The model learns your code.*
+
+1.  **Configure:** Edit `prepare_codebase.py` and set the `SOURCE_DIR` variable to the root directory of your firmware source code.
+2.  **Ingest Data:** Run the script. This will scan all your code files and create a single binary file (`train.bin`) for efficient training.
+    ```
+    python prepare_codebase.py
+    ```
+3.  **Train:**
     - Open `train_gpt.py`.
-    - Ensure `RUN_MODE = 'pretrain'`.
-    - Run `python train_gpt.py`.
-    - **Stop** when Loss < 1.5 (approx 20k-50k steps).
+    - At the top, set `RUN_MODE = 'pretrain'`.
+    - Select your hardware profile (`DEVICE_TYPE = 'epyc'` or `'laptop'`).
+    - Run the script: `python train_gpt.py`
+    - Let it run for several days until the loss drops below **1.5**. The script will save `model.pth` automatically.
 
-### Phase 2: The "Teacher" (SFT - Option B)
-*Goal: Create a smart Q&A dataset so the bot understands natural language.*
+### Step 2: Fine-Tuning (The "Teacher")
+*Now we teach the code-literate model how to be a helpful chatbot.*
 
-1.  **Install Ollama:** Download and install [Ollama](https://ollama.com/).
-2.  **Pull a Model:** Run `ollama run qwen2.5-coder:7b` (or `llama3`) in your terminal.
-3.  **Generate Data:**
-    - Edit `generate_synthetic_sft.py` -> Set `SOURCE_DIR` to your *critical* folders (e.g., drivers, core logic).
-    - Run `python generate_synthetic_sft.py`.
-    - This uses the local Ollama model to read your C functions and write English explanations for them.
-    - Output: `sft_train.bin`.
-
-4.  **Fine-Tune:**
+1.  **Prepare SFT Data:**
+    - Edit `prepare_sft_mix.py` and confirm `SOURCE_DIR` is set.
+    - Run the script. It will download an open-source dataset (`CodeAlpaca`) and mix it with snippets from your own code to create `sft_train.bin`.
+    ```
+    python prepare_sft_mix.py
+    ```
+2.  **Fine-Tune:**
     - Open `train_gpt.py`.
-    - Set `RUN_MODE = 'sft'`.
-    - Set `LEARNING_RATE = 1e-5` (Low and slow).
-    - Run `python train_gpt.py`.
-    - **Stop** after ~1000 steps.
+    - Change the configuration to `RUN_MODE = 'sft'`. The script will automatically use a lower learning rate and the new `sft_train.bin` file.
+    - Run the training script again: `python train_gpt.py`
+    - This will be very fast, likely finishing in a few hours. Let it run for its full 1000 steps.
 
-### Phase 3: Chat
-Run `python play.py` to talk to your new Firmware Assistant.
+### Step 3: Chat with Your AI
+1.  Once fine-tuning is complete, run the interactive chat client:
+    ```
+    python chat.py
+    ```
+2.  Ask it questions about your code! For example:
+    - *Explain the function `init_wifi`.*
+    - *Write a C function to reverse a linked list.*
 
