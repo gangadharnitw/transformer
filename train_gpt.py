@@ -6,53 +6,92 @@ import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
 
-# --- HARDWARE CONFIGURATION (Edit this based on machine) ---
-# CONFIG: "Laptop" (Ryzen 7840HS) vs "Server" (EPYC 7763)
+# ==========================================
+#           CONFIGURATION SECTION
+# ==========================================
 
-# UNCOMMENT FOR EPYC SERVER (64 Cores, 32GB RAM)
+# --- 1. RUN MODE ---
+# Set to 'pretrain' for Phase 1 (Raw Code)
+# Set to 'sft' for Phase 2 (Chat/Q&A)
+RUN_MODE = 'pretrain'  
+
+# --- 2. HARDWARE CONFIG ---
+# UNCOMMENT the block that matches your machine
+
+# [OPTION A] EPYC SERVER (64 Cores, 32GB RAM)
 BATCH_SIZE = 32
 BLOCK_SIZE = 1024
 GRAD_ACCUM_STEPS = 1
-MAX_ITERS = 20000
-NUM_THREADS = 32  # Restrict threads to avoid contention
+NUM_THREADS = 32  
 DEVICE = 'cpu'
 
-# UNCOMMENT FOR LAPTOP (8 Cores, 32GB RAM)
+# [OPTION B] LAPTOP (Ryzen 7840HS, 32GB RAM)
 # BATCH_SIZE = 4
 # BLOCK_SIZE = 512
 # GRAD_ACCUM_STEPS = 8
-# MAX_ITERS = 50000
 # NUM_THREADS = 8
 # DEVICE = 'cpu'
 
-# --- MODEL ARCHITECTURE (GPT-2 Small) ---
+# --- 3. HYPERPARAMETERS ---
+if RUN_MODE == 'pretrain':
+    MAX_ITERS = 20000
+    LEARNING_RATE = 3e-4
+    DATA_FILE = 'train.bin'
+    SAVE_EVERY = 500
+    DROPOUT = 0.1
+    print(f"--- STARTING PRE-TRAINING (Target Loss < 1.5) ---")
+    
+elif RUN_MODE == 'sft':
+    MAX_ITERS = 1000
+    LEARNING_RATE = 1e-5  # 30x slower for fine-tuning
+    DATA_FILE = 'sft_train.bin'
+    SAVE_EVERY = 100
+    DROPOUT = 0.1
+    print(f"--- STARTING SFT FINE-TUNING (Target Loss ~0.5) ---")
+
+# Model Architecture (GPT-2 Small)
 N_EMBD = 768
 N_HEAD = 12
 N_LAYER = 12
-DROPOUT = 0.1
-LEARNING_RATE = 3e-4
 EVAL_INTERVAL = 100
-SAVE_EVERY = 500
 
-# --- EPYC OPTIMIZATION ---
+# ==========================================
+#           SYSTEM OPTIMIZATION
+# ==========================================
 if DEVICE == 'cpu':
     torch.set_num_threads(NUM_THREADS)
+    torch.set_num_interop_threads(2)
     os.environ["OMP_NUM_THREADS"] = str(NUM_THREADS)
+    print(f"CPU Optimization: Using {NUM_THREADS} threads.")
 
-# --- DATA LOADER ---
+# ==========================================
+#              DATA LOADER
+# ==========================================
 def get_batch(split):
-    filename = 'train.bin' if split == 'train' else 'val.bin'
-    # Check if we are doing SFT (Fine Tuning)
-    if os.path.exists('sft_train.bin') and split == 'sft':
-        filename = 'sft_train.bin'
+    # Select file based on Split and Mode
+    if split == 'train':
+        filename = DATA_FILE
+    else:
+        filename = 'val.bin' # Always validate on raw code to check regression
+        
+    if not os.path.exists(filename):
+        print(f"ERROR: {filename} not found! Did you run the prepare script?")
+        exit()
         
     data = np.memmap(filename, dtype=np.uint16, mode='r')
+    
+    # Random offsets
     ix = torch.randint(len(data) - BLOCK_SIZE, (BATCH_SIZE,))
+    
+    # Cast to int64 for PyTorch
     x = torch.stack([torch.from_numpy((data[i:i+BLOCK_SIZE]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+BLOCK_SIZE+1]).astype(np.int64)) for i in ix])
+    
     return x.to(DEVICE), y.to(DEVICE)
 
-# --- GPT MODEL ---
+# ==========================================
+#           TRANSFORMER MODEL
+# ==========================================
 class Head(nn.Module):
     def __init__(self, head_size):
         super().__init__()
@@ -66,6 +105,7 @@ class Head(nn.Module):
         B,T,C = x.shape
         k = self.key(x)
         q = self.query(x)
+        # Scaled Dot-Product Attention
         wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         wei = F.softmax(wei, dim=-1)
@@ -88,7 +128,7 @@ class FeedFoward(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
-            nn.GELU(), # GPT-2 uses GELU, not ReLU
+            nn.GELU(),
             nn.Linear(4 * n_embd, n_embd),
             nn.Dropout(DROPOUT),
         )
@@ -110,7 +150,7 @@ class Block(nn.Module):
 class GPT(nn.Module):
     def __init__(self):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(50257, N_EMBD) # GPT-2 Vocab
+        self.token_embedding_table = nn.Embedding(50257, N_EMBD)
         self.position_embedding_table = nn.Embedding(BLOCK_SIZE, N_EMBD)
         self.blocks = nn.Sequential(*[Block(N_EMBD, N_HEAD) for _ in range(N_LAYER)])
         self.ln_f = nn.LayerNorm(N_EMBD)
@@ -133,47 +173,63 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits, targets)
         return logits, loss
 
-# --- MAIN TRAINING LOOP ---
+# ==========================================
+#           TRAINING ENGINE
+# ==========================================
 def train():
     model = GPT().to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
-    # RESUME IF EXISTS
+    # Always try to load existing weights
     if os.path.exists("model.pth"):
-        print("Resuming from model.pth...")
-        model.load_state_dict(torch.load("model.pth"))
+        print(">> Loading existing 'model.pth'...")
+        model.load_state_dict(torch.load("model.pth", map_location=DEVICE))
+        print(">> Weights Loaded! Continuing training...")
+    else:
+        print(">> No previous model found. Starting from scratch.")
 
-    print(f"Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
-    print(f"Threads: {torch.get_num_threads()}")
+    print(f"Model Size: {sum(p.numel() for p in model.parameters())/1e6:.2f} Million Parameters")
+    
+    model.train()
+    start_time = time.time()
 
     for iter in range(MAX_ITERS):
-        # EVALUATION
+        
+        # --- EVALUATION LOGGING ---
         if iter % EVAL_INTERVAL == 0:
             model.eval()
-            losses = torch.zeros(5)
-            for k in range(5):
-                X, Y = get_batch('train')
-                _, loss = model(X, Y)
-                losses[k] = loss.item()
-            print(f"Step {iter}: Loss {losses.mean():.4f}")
+            with torch.no_grad():
+                losses = torch.zeros(5)
+                for k in range(5):
+                    X, Y = get_batch('train')
+                    _, loss = model(X, Y)
+                    losses[k] = loss.item()
+                
+                dt = time.time() - start_time
+                print(f"Step {iter} | Loss: {losses.mean():.4f} | Time: {dt:.2f}s")
+                start_time = time.time() # Reset timer
             
             # Save Checkpoint
             if iter > 0 and iter % SAVE_EVERY == 0:
                 torch.save(model.state_dict(), "model.pth")
-                print("Saved checkpoint.")
+                print(f">> Saved model.pth at step {iter}")
+                
             model.train()
 
-        # TRAINING STEP
-        # Gradient Accumulation loop
+        # --- GRADIENT ACCUMULATION STEP ---
         optimizer.zero_grad(set_to_none=True)
         for _ in range(GRAD_ACCUM_STEPS):
             X, Y = get_batch('train')
             _, loss = model(X, Y)
-            loss = loss / GRAD_ACCUM_STEPS # Scale loss
+            loss = loss / GRAD_ACCUM_STEPS
             loss.backward()
             
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+    
+    # Final Save
+    torch.save(model.state_dict(), "model.pth")
+    print("TRAINING COMPLETE. Model saved.")
 
 if __name__ == "__main__":
     train()
