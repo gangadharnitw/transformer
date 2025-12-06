@@ -13,13 +13,15 @@ import numpy as np
 RUN_MODE = 'pretrain'  # Options: 'pretrain' or 'sft'
 
 # --- 2. HARDWARE PROFILE ---
-DEVICE_TYPE = 'epyc'   # Options: 'epyc' or 'laptop'
+# Set to 'laptop' for your Ryzen 7840HS
+# Set to 'epyc' for your Server
+DEVICE_TYPE = 'epyc'   
 
-# --- 3. HYPERPARAMETERS (Derived from selections) ---
+# --- 3. HYPERPARAMETERS ---
 if DEVICE_TYPE == 'epyc':
     BATCH_SIZE, BLOCK_SIZE, THREADS = 32, 1024, 32
     GRAD_ACCUM_STEPS = 1
-else: # Laptop config
+else: # Laptop
     BATCH_SIZE, BLOCK_SIZE, THREADS = 4, 512, 8
     GRAD_ACCUM_STEPS = 8
 
@@ -28,7 +30,7 @@ if RUN_MODE == 'pretrain':
 else: # SFT config
     LR, MAX_ITERS, DATA_FILE = 1e-5, 1000, 'sft_train.bin'
 
-# --- 4. MODEL ARCHITECTURE (GPT-2 Small) ---
+# --- 4. ARCHITECTURE (GPT-2 Small) ---
 N_EMBD, N_HEAD, N_LAYER, DROPOUT = 768, 12, 12, 0.1
 VOCAB_SIZE = 50257
 
@@ -36,6 +38,7 @@ VOCAB_SIZE = 50257
 DEVICE = 'cpu'
 EVAL_INTERVAL = 100
 SAVE_EVERY = 500
+VAL_FILE = 'val.bin'
 
 # ==========================================
 #           SYSTEM OPTIMIZATION
@@ -49,9 +52,20 @@ os.environ["OMP_NUM_THREADS"] = str(THREADS)
 def get_batch(split='train'):
     filename = VAL_FILE if split == 'val' else DATA_FILE
     if not os.path.exists(filename):
-        raise FileNotFoundError(f"{filename} not found! Run the appropriate 'prepare' script.")
+        # Fallback if val.bin doesn't exist, use train.bin
+        if split == 'val' and os.path.exists(DATA_FILE):
+            filename = DATA_FILE
+        else:
+            print(f"CRITICAL ERROR: {filename} not found! Run prepare script first.")
+            exit()
     
     data = np.memmap(filename, dtype=np.uint16, mode='r')
+    
+    # Safety check for small datasets
+    if len(data) <= BLOCK_SIZE:
+        print(f"Error: Dataset {filename} is too small ({len(data)} tokens) for Block Size {BLOCK_SIZE}.")
+        exit()
+
     ix = torch.randint(len(data) - BLOCK_SIZE, (BATCH_SIZE,))
     x = torch.stack([torch.from_numpy(data[i:i+BLOCK_SIZE].astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy(data[i+1:i+BLOCK_SIZE+1].astype(np.int64)) for i in ix])
@@ -60,7 +74,6 @@ def get_batch(split='train'):
 # ==========================================
 #           TRANSFORMER MODEL
 # ==========================================
-# Using the more stable and standard nn.TransformerEncoderLayer
 class GPT(nn.Module):
     def __init__(self):
         super().__init__()
@@ -81,11 +94,19 @@ class GPT(nn.Module):
         pos_emb = self.position_embedding(torch.arange(T, device=DEVICE))
         x = tok_emb + pos_emb
         
+        # Causal Mask (Ensures model can't see the future)
         causal_mask = nn.Transformer.generate_square_subsequent_mask(T).to(DEVICE)
-        x = self.transformer_encoder(x, mask=causal_mask)
+        x = self.transformer_encoder(x, mask=causal_mask, is_causal=True)
         
         logits = self.lm_head(self.ln_f(x))
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) if targets is not None else None
+        
+        loss = None
+        if targets is not None:
+            # Flatten to [Batch*Time, Vocab_Size] for Cross Entropy
+            logits = logits.view(-1, logits.size(-1))
+            targets = targets.view(-1)
+            loss = F.cross_entropy(logits, targets)
+            
         return logits, loss
 
 # ==========================================
@@ -97,46 +118,63 @@ def train():
 
     if os.path.exists("model.pth"):
         print(">> Loading existing 'model.pth' checkpoint...")
-        model.load_state_dict(torch.load("model.pth", map_location=DEVICE))
-        print(">> Weights loaded! Resuming training.")
+        try:
+            model.load_state_dict(torch.load("model.pth", map_location=DEVICE))
+            print(">> Weights loaded! Resuming training.")
+        except:
+            print(">> Warning: Checkpoint mismatch. Starting from scratch.")
     else:
         print(">> No checkpoint found. Starting from scratch.")
 
     print(f"Starting {RUN_MODE.upper()} on {DEVICE_TYPE.upper()}...")
     print(f"Params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M | Threads: {THREADS}")
 
+    model.train()
+    
     for i in range(MAX_ITERS):
         t0 = time.time()
         
-        # Eval and Save Logic
+        # --- EVALUATION LOOP ---
         if i % EVAL_INTERVAL == 0:
             model.eval()
             with torch.no_grad():
-                val_loss = get_batch('val')[1] # Simple single batch validation
+                # BUG FIX: Get data first, THEN run model to get loss
+                X_val, Y_val = get_batch('val') 
+                _, val_loss = model(X_val, Y_val)
+                
+                # BUG FIX: Ensure scalar
+                if val_loss.numel() > 1:
+                     val_loss = val_loss.mean()
+                
                 print(f"Step {i} | Val Loss: {val_loss.item():.4f}")
+            
             if i > 0 and i % SAVE_EVERY == 0:
                 torch.save(model.state_dict(), "model.pth")
                 print(f">> Checkpoint saved at step {i}")
             model.train()
 
-        # Training Step with Gradient Accumulation
+        # --- TRAINING STEP ---
         optimizer.zero_grad()
+        loss_accum = 0.0
+        
         for _ in range(GRAD_ACCUM_STEPS):
-            X, Y = get_batch()
+            X, Y = get_batch('train')
             _, loss = model(X, Y)
+            
             loss = loss / GRAD_ACCUM_STEPS
+            loss_accum += loss.item()
             loss.backward()
         
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         
+        # Logging
         if i % 10 == 0:
             dt = (time.time() - t0) * 1000
-            print(f"Iter {i}: Loss {loss.item() * GRAD_ACCUM_STEPS:.4f}, Time: {dt:.2f}ms")
+            print(f"Iter {i}: Loss {loss_accum:.4f}, Time: {dt:.2f}ms")
 
     torch.save(model.state_dict(), "model.pth")
     print("Final model saved. Training complete.")
 
 if __name__ == '__main__':
-    VAL_FILE = 'val.bin' # Define global for get_batch
     train()
